@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NFC 网易云碰碰贴 · 网页版</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: #17181d;
+    color: #eef0f6;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .card { width: 100%; max-width: 420px; }
+  h1 { font-size: 24px; margin-bottom: 6px; }
+  .sub { color: #9aa0ac; font-size: 14px; margin-bottom: 18px; }
+  input {
+    width: 100%; padding: 13px 14px; font-size: 15px;
+    background: #24262e; color: #eef0f6;
+    border: 1px solid #33363f; border-radius: 10px; outline: none;
+  }
+  input:focus { border-color: #2f9bff; }
+  .parsed {
+    min-height: 20px; margin-top: 12px; font-size: 13px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all; text-align: center;
+  }
+  .parsed.ok { color: #7ddb8d; }
+  .parsed.warn { color: #ffb35c; }
+  .parsed.err { color: #ff8d80; }
+  button {
+    width: 100%; margin-top: 14px; padding: 15px; font-size: 17px; font-weight: 700;
+    color: #fff; background: #2188e6; border: 0; border-radius: 10px; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  button.stop { background: #b3542e; }
+  button.secondary { background: #22252d; color: #b3ccff; font-size: 14px; font-weight: 400; }
+  .try {
+    display: block; margin-top: 10px; padding: 12px; text-align: center;
+    font-size: 14px; color: #b3ccff; background: #22252d;
+    border-radius: 10px; text-decoration: none;
+  }
+  .status {
+    margin-top: 16px; min-height: 44px; font-size: 15px; line-height: 1.5;
+    color: #ccd0da; text-align: center; white-space: pre-wrap;
+  }
+  .status.ok { color: #7ddb8d; }
+  .status.err { color: #ff8d80; }
+  .hint { margin-top: 18px; font-size: 12px; color: #6d7280; line-height: 1.6; text-align: center; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>NFC 网易云碰碰贴</h1>
+  <p class="sub">网页版：粘贴链接，直接写入 NFC 标签</p>
+
+  <input id="songInput" type="text" inputmode="url" autocomplete="off"
+         placeholder="https://music.163.com/song?id=29047169&...">
+  <div id="parsed" class="parsed"></div>
+
+  <button id="writeBtn">写入 NFC 标签</button>
+  <button id="readBtn" class="secondary">读取标签内容（写入后也会自动读回验证）</button>
+  <a id="tryLink" class="try" href="#" hidden>先试听一下（唤起网易云音乐）</a>
+
+  <div id="status" class="status">准备就绪</div>
+
+  <div class="hint">
+    需要安卓手机 Chrome / Edge 浏览器 + HTTPS 访问，iPhone 暂不支持网页写卡<br>
+    建议标签：NTAG213 / 215 / 216；门禁卡、银行卡写不了
+  </div>
+</main>
+
+<script>
+// ---------- 解析逻辑（与 App 版 songid.py 一致；短链受跨域限制不支持） ----------
+var RE_ORPHEUS = /orpheus:\/\/song\/(\d+)/;
+var RE_QUERY_ID = /[?&]id=(\d+)/;
+var RE_PATH_SONG = /163\.com\/(?:[a-z0-9]+\/)*song\/(\d+)/;
+var RE_PURE_ID = /^\d{3,15}$/;
+// 注意：分享文本形如 "分享xxx的单曲《...》: https://163cn.tv/xxx (来自@网易云音乐)"，
+// http 链接不一定在开头，所以只能用"包含"判断，不能用 ^ 锚定
+var RE_HTTP = /https?:\/\//;
+
+function extractSongId(text) {
+  text = (text || '').trim();
+  if (!text) return null;
+  var m = text.match(RE_ORPHEUS) || text.match(RE_QUERY_ID) || text.match(RE_PATH_SONG);
+  if (m) return m[1];
+  if (RE_PURE_ID.test(text)) return text;
+  return null;
+}
+
+var input = document.getElementById('songInput');
+var parsedEl = document.getElementById('parsed');
+var statusEl = document.getElementById('status');
+var writeBtn = document.getElementById('writeBtn');
+var tryLink = document.getElementById('tryLink');
+var currentUrl = null;
+
+var resolveSeq = 0;      // 输入序号：忽略过期的解析结果
+var resolveTimer = null;
+
+function setCurrentSong(id) {
+  currentUrl = 'orpheus://song/' + id + '/?autoplay=1';
+  parsedEl.textContent = '歌曲ID  ' + id + '\n将写入  ' + currentUrl;
+  parsedEl.className = 'parsed ok';
+  tryLink.href = currentUrl;
+  tryLink.hidden = false;
+}
+
+// 通过本机服务器解析短链（浏览器跨域限制，必须由服务端跟随跳转）
+async function resolveShortLink(text, seq) {
+  try {
+    var resp = await fetch('/resolve?text=' + encodeURIComponent(text));
+    var data = await resp.json();
+    if (seq !== resolveSeq) return;   // 输入已变化，丢弃过期结果
+    if (data.id) {
+      setCurrentSong(data.id);
+    } else {
+      parsedEl.textContent = data.error || '短链解析失败';
+      parsedEl.className = 'parsed err';
+    }
+  } catch (e) {
+    if (seq !== resolveSeq) return;
+    parsedEl.textContent = '短链解析需要用 python web/server.py 运行（纯静态托管不支持）\n请改用完整链接 https://music.163.com/song?id=...';
+    parsedEl.className = 'parsed warn';
+  }
+}
+
+function parse() {
+  var id = extractSongId(input.value);
+  if (id) {
+    resolveSeq++;   // 让还在路上的短链解析结果作废
+    setCurrentSong(id);
+    return;
+  }
+  currentUrl = null;
+  tryLink.hidden = true;
+  var text = input.value.trim();
+  if (text && RE_HTTP.test(text)) {
+    parsedEl.textContent = '链接里没有直接的歌曲ID，正在解析短链…';
+    parsedEl.className = 'parsed warn';
+    if (resolveTimer) clearTimeout(resolveTimer);
+    var seq = ++resolveSeq;
+    resolveTimer = setTimeout(function () { resolveShortLink(text, seq); }, 700);
+  } else {
+    parsedEl.textContent = '';
+    parsedEl.className = 'parsed';
+  }
+}
+input.addEventListener('input', parse);
+
+// 点写入/读取前调用：确保拿到歌曲URL（含短链的同步解析）
+async function ensureUrl() {
+  var id = extractSongId(input.value);
+  if (id) {
+    resolveSeq++;
+    setCurrentSong(id);
+    return currentUrl;
+  }
+  var text = input.value.trim();
+  if (!text || !RE_HTTP.test(text)) {
+    setStatus('请先粘贴有效的网易云分享链接或歌曲ID', 'err');
+    return null;
+  }
+  setStatus('正在解析短链…');
+  try {
+    var resp = await fetch('/resolve?text=' + encodeURIComponent(text));
+    var data = await resp.json();
+    if (data.id) {
+      setCurrentSong(data.id);
+      return currentUrl;
+    }
+    setStatus(data.error || '短链解析失败', 'err');
+  } catch (e) {
+    setStatus('短链解析失败：需要用 python web/server.py 运行本页\n或改用完整链接 https://music.163.com/song?id=...', 'err');
+  }
+  return null;
+}
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+// ---------- Web NFC 写卡 ----------
+var writeBtn = document.getElementById('writeBtn');
+var readBtn = document.getElementById('readBtn');
+var writeCtrl = null;   // 写卡会话
+var readCtrl = null;    // 读取会话
+
+function stopAllSessions() {
+  if (writeCtrl) writeCtrl.abort();
+  if (readCtrl) readCtrl.abort();
+}
+
+function setWriting(on) {
+  writeBtn.classList.toggle('stop', on);
+  writeBtn.textContent = on ? '停止写入' : '写入 NFC 标签';
+}
+
+function hexdump(buf) {
+  if (!buf) return '';
+  var bytes = new Uint8Array(buf), out = [];
+  for (var i = 0; i < bytes.length && i < 64; i++) {
+    out.push(('0' + bytes[i].toString(16)).slice(-2));
+  }
+  return out.join(' ') + (bytes.length > 64 ? ' …' : '');
+}
+
+function decodeRecord(r) {
+  var rt = r.recordType || '';
+  try {
+    if (rt === 'text') {
+      return new TextDecoder(r.encoding || 'utf-8').decode(r.data);
+    }
+    if (rt === 'url' || rt === 'absolute-url') {
+      return new TextDecoder().decode(r.data);
+    }
+    // external / 其他已知类型（如 AAR 的 'android.com:pkg'）：按 UTF-8 文本解码，
+    // 解不出可读文本再回退显示十六进制
+    var text = new TextDecoder('utf-8', { fatal: true }).decode(r.data);
+    if (text && /^[\x20-\x7e\t\n\r]+$/.test(text)) {
+      return text;
+    }
+  } catch (e) {}
+  return '(二进制 ' + (r.data ? r.data.byteLength : 0) + ' 字节: ' + hexdump(r.data) + ')';
+}
+
+// 读取标签：autoAfterWrite=true 时是写完后的自动读回验证（静默提示）
+async function readTag(autoAfterWrite) {
+  if (!('NDEFReader' in window)) {
+    if (!autoAfterWrite) {
+      setStatus('这个浏览器不支持 Web NFC：请用安卓手机上的 Chrome 或 Edge 打开本页（且必须 https 访问）', 'err');
+    }
+    return;
+  }
+  if (readCtrl) readCtrl.abort();
+  readCtrl = new AbortController();
+  var signal = readCtrl.signal;
+  var got = false;
+  var ndef = new NDEFReader();
+  ndef.onreading = function (event) {
+    got = true;
+    readCtrl.abort();
+    var lines = [];
+    var recs = event.message.records;
+    if (!recs.length) lines.push('（标签上没有 NDEF 记录 —— 标签是空的！）');
+    for (var i = 0; i < recs.length; i++) {
+      lines.push('记录' + (i + 1) + ' 类型[' + recs[i].recordType + '] ' + decodeRecord(recs[i]));
+    }
+    if (event.serialNumber) lines.push('标签序列号: ' + event.serialNumber);
+    setStatus('📖 读到标签内容：\n' + lines.join('\n'), 'ok');
+  };
+  ndef.onreadingerror = function () {
+    if (!signal.aborted) {
+      got = true;
+      setStatus('读取失败：这个标签不是标准 NDEF 格式，或读取时拿开了', 'err');
+    }
+  };
+  try {
+    await ndef.scan({ signal: signal });
+    if (!autoAfterWrite) setStatus('读取模式已开启：请把手机背面贴到标签上（30秒内）…');
+    setTimeout(function () {
+      if (!got && !signal.aborted) {
+        readCtrl.abort();
+        setStatus(autoAfterWrite
+          ? '✅ 写入成功。但读回验证没等到标签（手机贴久一点再试，或点"读取标签内容"手动读）'
+          : '读取超时：30秒内没有等到标签', 'warn');
+      }
+    }, autoAfterWrite ? 15000 : 30000);
+  } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      setStatus('NFC 权限被拒绝，请重新操作并在弹窗里允许', 'err');
+    } else if (e.name === 'NotSupportedError') {
+      setStatus('当前环境不支持 Web NFC：需要安卓 Chrome/Edge，并通过 HTTPS 访问本页', 'err');
+    } else if (e.name !== 'AbortError') {
+      setStatus('读取失败：' + (e.message || e.name), 'err');
+    }
+  }
+}
+
+readBtn.addEventListener('click', function () { readTag(false); });
+
+async function toggleWrite() {
+  if (writeCtrl) {              // 正在写卡 -> 停止
+    writeCtrl.abort();
+    return;
+  }
+  if (readCtrl) readCtrl.abort();
+  if (!('NDEFReader' in window)) {
+    setStatus('这个浏览器不支持 Web NFC：请用安卓手机上的 Chrome 或 Edge 打开本页（且必须 https 访问）', 'err');
+    return;
+  }
+  var url = await ensureUrl();
+  if (!url) return;
+  writeCtrl = new AbortController();
+  var signal = writeCtrl.signal;
+  var timer = setTimeout(function () { writeCtrl.abort(); }, 60000);
+  setWriting(true);
+  setStatus('写卡模式已开启：请把手机背面贴到标签上，别拿开（60秒内有效）');
+  try {
+    var ndef = new NDEFReader();
+    // 两条记录，和 NFC Tools 手工写的格式一致：
+    //   1) URL 记录：orpheus 链接（碰卡时由系统/网易云解析）
+    //   2) Android Application Record：网易云包名，强制安卓把标签分发给网易云，
+    //      没有它，部分手机碰自定义协议标签不会有任何反应。
+    // 注意：Chromium 要求 external 记录的 recordType 直接写完整类型名
+    // （'android.com:pkg'），写成 recordType:'external' + type 反而会报
+    // "Invalid NDEFRecord type"。
+    await ndef.write({
+      records: [
+        { recordType: 'url', data: currentUrl },
+        { recordType: 'android.com:pkg',
+          data: new TextEncoder().encode('com.netease.cloudmusic') }
+      ],
+      signal: signal
+    });
+    clearTimeout(timer);
+    setWriting(false);
+    writeCtrl = null;
+    setStatus('✅ 写入成功（URL + 网易云应用记录）！正在读回验证，请保持手机贴着标签…', 'ok');
+    readTag(true);
+  } catch (e) {
+    clearTimeout(timer);
+    setWriting(false);
+    writeCtrl = null;
+    if (e.name === 'AbortError') {
+      setStatus('已停止：60秒内没有等到标签，或手动取消');
+    } else if (e.name === 'NotAllowedError') {
+      setStatus('NFC 权限被拒绝，请重新点"写入"并在弹窗里允许', 'err');
+    } else if (e.name === 'NotSupportedError') {
+      setStatus('当前环境不支持 Web NFC：需要安卓 Chrome/Edge，并通过 HTTPS 访问本页', 'err');
+    } else if (e.name === 'NetworkError') {
+      setStatus('写入中断：手机和标签中途分开了，请重试', 'err');
+    } else {
+      setStatus('写入失败：' + (e.message || e.name) + '\n（空白卡可能需要先用 App 版或 NFC Tools 格式化）', 'err');
+    }
+  }
+}
+writeBtn.addEventListener('click', toggleWrite);
+
+// 环境提示
+if (!('NDEFReader' in window)) {
+  if (!/Android/i.test(navigator.userAgent)) {
+    setStatus('电脑上没有 NFC：请用安卓手机（Chrome/Edge）打开本页测试');
+  } else {
+    setStatus('当前浏览器不支持 Web NFC：请改用安卓 Chrome 或 Edge');
+  }
+} else {
+  setStatus('就绪：粘贴链接后点"写入"，然后贴近标签');
+}
+</script>
+</body>
+</html>
